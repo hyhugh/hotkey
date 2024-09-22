@@ -1,23 +1,21 @@
 use core::slice;
 use std::{
-    error::Error,
-    ffi::{c_void, CStr, CString},
+    ffi::{c_void, CStr},
     mem,
 };
 
 use anyhow::anyhow;
-use windows::{
-    core::{s, PCSTR},
-    Win32::{
-        Foundation::{CloseHandle, BOOL, HWND, INVALID_HANDLE_VALUE, LPARAM},
-        System::Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32,
-            TH32CS_SNAPPROCESS,
-        },
-        UI::WindowsAndMessaging::{
-            EnumThreadWindows, EnumWindows, FindWindowA, ShowWindow, HIDE_WINDOW, SHOW_WINDOW_CMD,
-            SW_FORCEMINIMIZE, SW_HIDE, SW_MAXIMIZE, SW_SHOW, WNDENUMPROC,
-        },
+use log::debug;
+use simple_logger::SimpleLogger;
+use windows::Win32::{
+    Foundation::{CloseHandle, BOOL, HWND, INVALID_HANDLE_VALUE, LPARAM},
+    System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
+    },
+    UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameA, GetParent, GetWindow, GetWindowModuleFileNameA, GetWindowTextA,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, ShowWindow, GW_OWNER, SW_MINIMIZE,
+        SW_RESTORE,
     },
 };
 use windows_hotkeys::{
@@ -26,17 +24,7 @@ use windows_hotkeys::{
     HotkeyManagerImpl,
 };
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_enum_processes() {
-        get_pid_of_exe("Telegram").unwrap();
-    }
-}
-
-fn get_pid_of_exe(target_exe_name: &str) -> anyhow::Result<Vec<u32>> {
+fn get_pids_of_exe(target_exe_name: &str) -> anyhow::Result<Vec<u32>> {
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }?;
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(anyhow!("invalid handle"));
@@ -50,8 +38,12 @@ fn get_pid_of_exe(target_exe_name: &str) -> anyhow::Result<Vec<u32>> {
     let mut processes: Vec<u32> = vec![];
 
     loop {
-        let string_parts: &[u8] =
-            unsafe { slice::from_raw_parts(process_entry.szExeFile.as_ptr() as _, 260) };
+        let string_parts: &[u8] = unsafe {
+            slice::from_raw_parts(
+                process_entry.szExeFile.as_ptr() as _,
+                process_entry.szExeFile.len(),
+            )
+        };
         let exe_name = CStr::from_bytes_until_nul(&string_parts)?;
 
         if exe_name
@@ -75,7 +67,7 @@ fn get_pid_of_exe(target_exe_name: &str) -> anyhow::Result<Vec<u32>> {
     }
     unsafe { CloseHandle(snapshot) }?;
 
-    println!(
+    debug!(
         "Found process: {:?}, pid: {:?}",
         target_exe_name, &processes
     );
@@ -83,8 +75,131 @@ fn get_pid_of_exe(target_exe_name: &str) -> anyhow::Result<Vec<u32>> {
     Ok(processes)
 }
 
-fn enum_window_of_pid() -> anyhow::Result<()> {
-    let handler = |handler: HWND| -> bool { false };
+fn get_class_name_of_window(hwnd: HWND) -> anyhow::Result<String> {
+    let mut name_buffer: [u8; 256] = [0; 256];
+    unsafe { GetClassNameA(hwnd, &mut name_buffer) };
+
+    Ok(CStr::from_bytes_until_nul(&name_buffer)?.to_str()?.into())
+}
+
+fn has_parent(hwnd: HWND) -> bool {
+    match unsafe { GetParent(hwnd) } {
+        Ok(parent_hwnd) => {
+            debug!("parent_hwnd: {:?}", parent_hwnd);
+            parent_hwnd != hwnd
+        }
+        Err(err) => {
+            debug!("GetParent error: {:?}", err);
+            false
+        }
+    }
+}
+
+fn is_main_window(hwnd: HWND) -> bool {
+    match unsafe { GetWindow(hwnd, GW_OWNER) } {
+        Ok(owner_hwnd) => {
+            debug!("owner_hwnd: {:?}", owner_hwnd);
+            owner_hwnd != hwnd
+        }
+        Err(err) => {
+            debug!("GetWindow error: {:?}", err);
+            true
+        }
+    }
+}
+
+fn get_window_text(hwnd: HWND) -> anyhow::Result<String> {
+    let mut text_buffer: [u8; 256] = [0; 256];
+    unsafe { GetWindowTextA(hwnd, &mut text_buffer) };
+
+    Ok(CStr::from_bytes_until_nul(&text_buffer)?.to_str()?.into())
+}
+
+fn get_window_module_file_name(hwnd: HWND) -> anyhow::Result<String> {
+    let mut text_buffer: [u8; 256] = [0; 256];
+    unsafe { GetWindowModuleFileNameA(hwnd, &mut text_buffer) };
+
+    Ok(CStr::from_bytes_until_nul(&text_buffer)?.to_str()?.into())
+}
+
+fn toggle_window_visibility_of_pid(
+    pid: u32,
+    allowlisted_classes: &Vec<String>,
+    excluded_window_texts: &Vec<String>,
+) -> anyhow::Result<()> {
+    let handler = move |handler: HWND| -> bool {
+        let mut process_id: u32 = 0;
+
+        unsafe { GetWindowThreadProcessId(handler, Some(&mut process_id)) };
+
+        if process_id == pid {
+            debug!("Found window for pid \n{:?}", handler);
+
+            let class_name = get_class_name_of_window(handler);
+            let class_name = match class_name {
+                Ok(name) => name,
+                Err(_) => return true,
+            };
+
+            let window_text = get_window_text(handler);
+            match window_text {
+                Ok(text) => {
+                    if excluded_window_texts.contains(&text) {
+                        debug!("Excluded window text: {:?}", text);
+                        return true;
+                    }
+                }
+                Err(_) => {
+                    // Ignore if failing to get text
+                }
+            };
+
+            let window_module_file_name = get_window_module_file_name(handler);
+            match window_module_file_name {
+                Ok(file_name) => {
+                    debug!("Found window module name: \n{:?}", file_name,);
+                }
+                Err(_) => {
+                    // Ignore if failing to get module filename
+                }
+            }
+
+            let has_parent = has_parent(handler);
+            if has_parent {
+                debug!("Has parent, skipping!");
+                return true;
+            }
+
+            let is_main = is_main_window(handler);
+            if !is_main {
+                debug!("Not main window, skipping!");
+                return true;
+            }
+
+            if !allowlisted_classes.contains(&class_name) {
+                debug!("Not in allowlisted classes: {:?}", class_name);
+                return true;
+            }
+
+            let is_visible = unsafe { IsWindowVisible(handler) };
+            if !is_visible.as_bool() {
+                debug!("Not visible, skipping!");
+                return true;
+            }
+
+            let is_minimised = unsafe { IsIconic(handler) };
+            if !is_minimised.as_bool() {
+                let result = unsafe { ShowWindow(handler, SW_MINIMIZE) };
+                debug!("ShowWindow(hide) result: {:?}", result);
+            } else {
+                // Window is minimized.
+                let result = unsafe { ShowWindow(handler, SW_RESTORE) };
+                debug!("ShowWindow(restore) result: {:?}", result);
+            }
+        }
+
+        true
+    };
 
     enumerate_windows(handler);
 
@@ -97,7 +212,7 @@ where
 {
     let mut trait_obj: &mut dyn FnMut(HWND) -> bool = &mut callback;
     let closure_pointer_pointer: *mut c_void = unsafe { mem::transmute(&mut trait_obj) };
-    let result = unsafe {
+    let _ = unsafe {
         EnumWindows(
             Some(enumerate_callback),
             LPARAM(closure_pointer_pointer as _),
@@ -114,28 +229,46 @@ unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL
     }
 }
 
-fn find_window(window_name: &str) -> anyhow::Result<()> {
-    let window_name = format!("{}\0", window_name);
-    let window_handle = unsafe { FindWindowA(PCSTR(window_name.as_ptr()), PCSTR::null()) }?;
-    println!("Found Telegram window \n{:?}", window_handle);
-
-    let result = unsafe { ShowWindow(window_handle, SW_HIDE) };
-    println!("ShowWindow result: {:?}", result);
-
-    Ok(())
-}
-
 fn start_event_loop() {
     let mut hkm = HotkeyManager::new();
 
+    hkm.register(
+        VKey::CustomKeyCode(0x32),
+        &[ModKey::Alt, ModKey::Ctrl],
+        || {
+            debug!("Pressed Alt+Ctrl+2");
+
+            let pids = get_pids_of_exe("Telegram").unwrap();
+            for id in pids {
+                let _ = toggle_window_visibility_of_pid(
+                    id,
+                    &vec!["Qt51515QWindowIcon".into()],
+                    &vec!["Media viewer".into()],
+                );
+            }
+        },
+    )
+    .unwrap();
+
     hkm.register(VKey::E, &[ModKey::Alt, ModKey::Ctrl], || {
-        println!("Pressed Alt+Ctrl+E");
+        debug!("Pressed Alt+Ctrl+e");
+
+        let pids = get_pids_of_exe("WindowsTerminal").unwrap();
+        for id in pids {
+            let _ = toggle_window_visibility_of_pid(
+                id,
+                &vec!["CASCADIA_HOSTING_WINDOW_CLASS".into()],
+                &vec![],
+            );
+        }
     })
-    .expect("Failed to map");
+    .unwrap();
 
     hkm.event_loop();
 }
 
 fn main() {
-    let _ = find_window("Qt51515QWindowIcon");
+    SimpleLogger::new().init().unwrap();
+
+    start_event_loop();
 }
