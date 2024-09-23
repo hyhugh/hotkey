@@ -1,11 +1,13 @@
 use core::slice;
 use std::{
+    env,
     ffi::{c_void, CStr},
-    mem,
+    fs, mem,
 };
 
 use anyhow::anyhow;
 use log::debug;
+use serde::Deserialize;
 use simple_logger::SimpleLogger;
 use windows::Win32::{
     Foundation::{CloseHandle, BOOL, HWND, INVALID_HANDLE_VALUE, LPARAM},
@@ -229,40 +231,38 @@ unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL
     }
 }
 
-fn start_event_loop() {
+fn start_event_loop(config: &Config) {
     let mut hkm = HotkeyManager::new();
 
-    hkm.register(
-        VKey::CustomKeyCode(0x32),
-        &[ModKey::Alt, ModKey::Ctrl],
-        || {
-            debug!("Pressed Alt+Ctrl+2");
+    for c in &(config.hotkeys) {
+        let modifiers: Vec<ModKey> = c
+            .modifiers
+            .iter()
+            .map(|k| {
+                ModKey::from_keyname(k.to_uppercase().as_str())
+                    .expect(format!("Unknown mod key {}", k).as_str())
+            })
+            .collect();
+        let trigger_key = VKey::from_char(c.trigger_key.chars().next().unwrap())
+            .expect(format!("Unknown trigger key {}", c.trigger_key).as_str());
+        let exe_name = c.exe_name.clone();
+        let allowlisted_classes = c.allowlisted_classes.clone();
+        let excluded_window_texts = c.excluded_window_texts.clone();
 
-            let pids = get_pids_of_exe("Telegram").unwrap();
+        hkm.register(trigger_key, &(modifiers.clone()), move || {
+            debug!("Pressed {:?} + {:?}", modifiers, trigger_key);
+
+            let pids = get_pids_of_exe(&exe_name).unwrap();
             for id in pids {
                 let _ = toggle_window_visibility_of_pid(
                     id,
-                    &vec!["Qt51515QWindowIcon".into()],
-                    &vec!["Media viewer".into()],
+                    &allowlisted_classes,
+                    &excluded_window_texts,
                 );
             }
-        },
-    )
-    .unwrap();
-
-    hkm.register(VKey::E, &[ModKey::Alt, ModKey::Ctrl], || {
-        debug!("Pressed Alt+Ctrl+e");
-
-        let pids = get_pids_of_exe("WindowsTerminal").unwrap();
-        for id in pids {
-            let _ = toggle_window_visibility_of_pid(
-                id,
-                &vec!["CASCADIA_HOSTING_WINDOW_CLASS".into()],
-                &vec![],
-            );
-        }
-    })
-    .unwrap();
+        })
+        .expect(format!("Failed to register hotkey {:?}", c).as_str());
+    }
 
     hkm.event_loop();
 }
@@ -270,5 +270,33 @@ fn start_event_loop() {
 fn main() {
     SimpleLogger::new().init().unwrap();
 
-    start_event_loop();
+    // Collect the command-line arguments into a vector
+    let args: Vec<String> = env::args().collect();
+
+    // args[0] is the program name, so we check if there are additional arguments
+    let config_path = if args.len() != 2 {
+        "sample_config.toml"
+    } else {
+        debug!("Received argument: {}", args[1]);
+        &args[1]
+    };
+
+    let config_str = fs::read_to_string(config_path).unwrap();
+    let config: Config = toml::from_str(&config_str).unwrap();
+    dbg!(&config);
+    start_event_loop(&config);
+}
+
+#[derive(Deserialize, Debug)]
+struct Config {
+    hotkeys: Vec<Hotkey>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Hotkey {
+    exe_name: String,
+    trigger_key: String,
+    modifiers: Vec<String>,
+    allowlisted_classes: Vec<String>,
+    excluded_window_texts: Vec<String>,
 }

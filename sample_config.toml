@@ -1,0 +1,13 @@
+[[hotkeys]]
+modifiers = ["alt", "ctrl"]
+trigger_key = "e"
+exe_name = "WindowsTerminal"
+allowlisted_classes = ["CASCADIA_HOSTING_WINDOW_CLASS"]
+excluded_window_texts = []
+
+[[hotkeys]]
+modifiers = ["alt", "ctrl"]
+trigger_key = "2"
+exe_name = "Telegram"
+allowlisted_classes = ["Qt51515QWindowIcon"]
+excluded_window_texts = ["Media viewer"]
