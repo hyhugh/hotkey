@@ -129,21 +129,21 @@ fn toggle_window_visibility_of_pid(
     allowlisted_classes: &Vec<String>,
     excluded_window_texts: &Vec<String>,
 ) -> anyhow::Result<()> {
-    let handler = move |handler: HWND| -> bool {
+    let handler = move |hwnd: HWND| -> bool {
         let mut process_id: u32 = 0;
 
-        unsafe { GetWindowThreadProcessId(handler, Some(&mut process_id)) };
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
 
         if process_id == pid {
-            debug!("Found window for pid \n{:?}", handler);
+            debug!("Found window for pid \n{:?}", hwnd);
 
-            let class_name = get_class_name_of_window(handler);
+            let class_name = get_class_name_of_window(hwnd);
             let class_name = match class_name {
                 Ok(name) => name,
                 Err(_) => return true,
             };
 
-            let window_text = get_window_text(handler);
+            let window_text = get_window_text(hwnd);
             match window_text {
                 Ok(text) => {
                     if excluded_window_texts.contains(&text) {
@@ -156,7 +156,7 @@ fn toggle_window_visibility_of_pid(
                 }
             };
 
-            let window_module_file_name = get_window_module_file_name(handler);
+            let window_module_file_name = get_window_module_file_name(hwnd);
             match window_module_file_name {
                 Ok(file_name) => {
                     debug!("Found window module name: \n{:?}", file_name,);
@@ -166,13 +166,13 @@ fn toggle_window_visibility_of_pid(
                 }
             }
 
-            let has_parent = has_parent(handler);
+            let has_parent = has_parent(hwnd);
             if has_parent {
                 debug!("Has parent, skipping!");
                 return true;
             }
 
-            let is_main = is_main_window(handler);
+            let is_main = is_main_window(hwnd);
             if !is_main {
                 debug!("Not main window, skipping!");
                 return true;
@@ -183,19 +183,19 @@ fn toggle_window_visibility_of_pid(
                 return true;
             }
 
-            let is_visible = unsafe { IsWindowVisible(handler) };
+            let is_visible = unsafe { IsWindowVisible(hwnd) };
             if !is_visible.as_bool() {
                 debug!("Not visible, skipping!");
                 return true;
             }
 
-            let is_minimised = unsafe { IsIconic(handler) };
+            let is_minimised = unsafe { IsIconic(hwnd) };
             if !is_minimised.as_bool() {
-                let result = unsafe { ShowWindow(handler, SW_MINIMIZE) };
+                let result = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
                 debug!("ShowWindow(hide) result: {:?}", result);
             } else {
                 // Window is minimized.
-                let result = unsafe { ShowWindow(handler, SW_RESTORE) };
+                let result = unsafe { ShowWindow(hwnd, SW_RESTORE) };
                 debug!("ShowWindow(restore) result: {:?}", result);
             }
         }
