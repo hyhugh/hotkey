@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use core::slice;
 use std::{
     env,
