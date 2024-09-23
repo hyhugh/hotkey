@@ -5,6 +5,7 @@ use std::{
     env,
     ffi::{c_void, CStr},
     fs, mem,
+    sync::Arc,
 };
 
 use anyhow::anyhow;
@@ -245,13 +246,16 @@ fn start_event_loop(config: &Config) {
                     .expect(format!("Unknown mod key {}", k).as_str())
             })
             .collect();
+        let modifiers = Arc::new(modifiers);
+
         let trigger_key = VKey::from_char(c.trigger_key.chars().next().unwrap())
             .expect(format!("Unknown trigger key {}", c.trigger_key).as_str());
+
         let exe_name = c.exe_name.clone();
         let allowlisted_classes = c.allowlisted_classes.clone();
         let excluded_window_texts = c.excluded_window_texts.clone();
 
-        hkm.register(trigger_key, &(modifiers.clone()), move || {
+        hkm.register(trigger_key, &modifiers.clone(), move || {
             debug!("Pressed {:?} + {:?}", modifiers, trigger_key);
 
             let pids = get_pids_of_exe(&exe_name).unwrap();
