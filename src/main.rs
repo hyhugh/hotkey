@@ -35,8 +35,10 @@ fn get_pids_of_exe(target_exe_name: &str) -> anyhow::Result<Vec<u32>> {
         return Err(anyhow!("invalid handle"));
     }
 
-    let mut process_entry = PROCESSENTRY32::default();
-    process_entry.dwSize = mem::size_of::<PROCESSENTRY32>() as u32;
+    let mut process_entry = PROCESSENTRY32 {
+        dwSize: mem::size_of::<PROCESSENTRY32>() as u32,
+        ..Default::default()
+    };
 
     unsafe { Process32First(snapshot, &mut process_entry) }?;
 
@@ -49,7 +51,7 @@ fn get_pids_of_exe(target_exe_name: &str) -> anyhow::Result<Vec<u32>> {
                 process_entry.szExeFile.len(),
             )
         };
-        let exe_name = CStr::from_bytes_until_nul(&string_parts)?;
+        let exe_name = CStr::from_bytes_until_nul(string_parts)?;
 
         if exe_name
             .to_str()?
@@ -59,8 +61,10 @@ fn get_pids_of_exe(target_exe_name: &str) -> anyhow::Result<Vec<u32>> {
             processes.push(process_entry.th32ProcessID);
         }
 
-        process_entry = PROCESSENTRY32::default();
-        process_entry.dwSize = mem::size_of::<PROCESSENTRY32>() as u32;
+        process_entry = PROCESSENTRY32 {
+            dwSize: mem::size_of::<PROCESSENTRY32>() as u32,
+            ..Default::default()
+        };
 
         match unsafe { Process32Next(snapshot, &mut process_entry) } {
             Ok(_) => {}
@@ -129,8 +133,8 @@ fn get_window_module_file_name(hwnd: HWND) -> anyhow::Result<String> {
 
 fn toggle_window_visibility_of_pid(
     pid: u32,
-    allowlisted_classes: &Vec<String>,
-    excluded_window_texts: &Vec<String>,
+    allowlisted_classes: &[String],
+    excluded_window_texts: &[String],
 ) -> anyhow::Result<()> {
     let handler = move |hwnd: HWND| -> bool {
         let mut process_id: u32 = 0;
@@ -236,6 +240,8 @@ where
 }
 
 unsafe extern "system" fn enumerate_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // Disable clippy here because it is too verbose to not use transmute.
+    #[allow(clippy::transmute_ptr_to_ref)]
     let closure: &mut &mut dyn FnMut(HWND) -> bool = mem::transmute(lparam.0 as *mut c_void);
     if closure(hwnd) {
         BOOL(1)
@@ -253,13 +259,13 @@ fn start_event_loop(config: &Config) {
             .iter()
             .map(|k| {
                 ModKey::from_keyname(k.to_uppercase().as_str())
-                    .expect(format!("Unknown mod key {}", k).as_str())
+                    .unwrap_or_else(|_| panic!("Unknown mod key {}", k))
             })
             .collect();
         let modifiers = Arc::new(modifiers);
 
         let trigger_key = VKey::from_char(c.trigger_key.chars().next().unwrap())
-            .expect(format!("Unknown trigger key {}", c.trigger_key).as_str());
+            .unwrap_or_else(|_| panic!("Unknown trigger key {}", c.trigger_key));
 
         let exe_name = c.exe_name.clone();
         let allowlisted_classes = c.allowlisted_classes.clone();
@@ -277,7 +283,7 @@ fn start_event_loop(config: &Config) {
                 );
             }
         })
-        .expect(format!("Failed to register hotkey {:?}", c).as_str());
+        .unwrap_or_else(|_| panic!("Failed to register hotkey {:?}", c));
     }
 
     hkm.event_loop();
