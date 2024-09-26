@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use log::debug;
+use log::{debug, info};
 use serde::Deserialize;
 use simple_logger::SimpleLogger;
 use windows::Win32::{
@@ -18,9 +18,9 @@ use windows::Win32::{
         CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
     },
     UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameA, GetParent, GetWindow, GetWindowModuleFileNameA, GetWindowTextA,
-        GetWindowThreadProcessId, IsIconic, IsWindowVisible, ShowWindow, GW_OWNER, SW_MINIMIZE,
-        SW_RESTORE,
+        EnumWindows, GetClassNameA, GetForegroundWindow, GetParent, GetWindow,
+        GetWindowModuleFileNameA, GetWindowTextA, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, SetForegroundWindow, ShowWindow, GW_OWNER, SW_MINIMIZE, SW_RESTORE,
     },
 };
 use windows_hotkeys::{
@@ -194,8 +194,18 @@ fn toggle_window_visibility_of_pid(
 
             let is_minimised = unsafe { IsIconic(hwnd) };
             if !is_minimised.as_bool() {
-                let result = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
-                debug!("ShowWindow(hide) result: {:?}", result);
+                let active_hwnd = unsafe { GetForegroundWindow() };
+                let is_active = active_hwnd == hwnd;
+                info!("Topmost: {:?}, {:?}, {:?}", is_active, active_hwnd, hwnd);
+
+                if is_active {
+                    debug!("Topmost window, minimizing!");
+                    let result = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+                    debug!("ShowWindow(minimize) result: {:?}", result);
+                } else {
+                    let _ = unsafe { SetForegroundWindow(hwnd) };
+                    info!("Not Topmost window, bringing to top!");
+                }
             } else {
                 // Window is minimized.
                 let result = unsafe { ShowWindow(hwnd, SW_RESTORE) };
@@ -273,6 +283,20 @@ fn start_event_loop(config: &Config) {
     hkm.event_loop();
 }
 
+#[derive(Deserialize, Debug)]
+struct Config {
+    hotkeys: Vec<Hotkey>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Hotkey {
+    exe_name: String,
+    trigger_key: String,
+    modifiers: Vec<String>,
+    allowlisted_classes: Vec<String>,
+    excluded_window_texts: Vec<String>,
+}
+
 fn main() {
     SimpleLogger::new().init().unwrap();
 
@@ -291,18 +315,4 @@ fn main() {
     let config: Config = toml::from_str(&config_str).unwrap();
     dbg!(&config);
     start_event_loop(&config);
-}
-
-#[derive(Deserialize, Debug)]
-struct Config {
-    hotkeys: Vec<Hotkey>,
-}
-
-#[derive(Deserialize, Debug)]
-struct Hotkey {
-    exe_name: String,
-    trigger_key: String,
-    modifiers: Vec<String>,
-    allowlisted_classes: Vec<String>,
-    excluded_window_texts: Vec<String>,
 }
