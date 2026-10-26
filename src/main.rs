@@ -5,6 +5,8 @@ use std::{
     env,
     ffi::{c_void, CStr},
     fs, mem,
+    os::windows::ffi::OsStringExt,
+    process::Command,
     sync::Arc,
 };
 
@@ -17,10 +19,12 @@ use windows::Win32::{
     System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
     },
+    System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION},
     UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameA, GetForegroundWindow, GetParent, GetWindow,
-        GetWindowModuleFileNameA, GetWindowTextA, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible, SetForegroundWindow, ShowWindow, GW_OWNER, SW_MINIMIZE, SW_RESTORE,
+        GetWindowModuleFileNameA, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, SetForegroundWindow, SetWindowPlacement, ShowWindow, GW_OWNER,
+        SW_FORCEMINIMIZE, SW_MINIMIZE, SW_RESTORE,
     },
 };
 use windows_hotkeys::{
@@ -118,10 +122,12 @@ fn is_main_window(hwnd: HWND) -> bool {
 }
 
 fn get_window_text(hwnd: HWND) -> anyhow::Result<String> {
-    let mut text_buffer: [u8; 256] = [0; 256];
-    unsafe { GetWindowTextA(hwnd, &mut text_buffer) };
-
-    Ok(CStr::from_bytes_until_nul(&text_buffer)?.to_str()?.into())
+    // Window titles are UTF-16. The ANSI API uses the system code page, which
+    // cannot be decoded as UTF-8 when chat titles contain non-ASCII characters.
+    let length = unsafe { GetWindowTextLengthW(hwnd) }.max(0) as usize;
+    let mut text_buffer = vec![0u16; length + 1];
+    let copied = unsafe { GetWindowTextW(hwnd, &mut text_buffer) } as usize;
+    Ok(String::from_utf16_lossy(&text_buffer[..copied]))
 }
 
 fn get_window_module_file_name(hwnd: HWND) -> anyhow::Result<String> {
@@ -191,13 +197,15 @@ fn toggle_window_visibility_of_pid(
             }
 
             let is_visible = unsafe { IsWindowVisible(hwnd) };
-            if !is_visible.as_bool() {
-                debug!("Not visible, skipping!");
-                return true;
-            }
-
             let is_minimised = unsafe { IsIconic(hwnd) };
-            if !is_minimised.as_bool() {
+            if !is_visible.as_bool() || is_minimised.as_bool() {
+                // Closing a tray app can hide its window without minimizing it.
+                // Restore both states before requesting foreground activation.
+                let result = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+                debug!("ShowWindow(restore) result: {:?}", result);
+                let result = unsafe { SetForegroundWindow(hwnd) };
+                debug!("SetForegroundWindow(restore) result: {:?}", result);
+            } else {
                 let active_hwnd = unsafe { GetForegroundWindow() };
                 let is_active = active_hwnd == hwnd;
                 info!("Topmost: {:?}, {:?}, {:?}", is_active, active_hwnd, hwnd);
@@ -210,10 +218,6 @@ fn toggle_window_visibility_of_pid(
                     let _ = unsafe { SetForegroundWindow(hwnd) };
                     info!("Not Topmost window, bringing to top!");
                 }
-            } else {
-                // Window is minimized.
-                let result = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-                debug!("ShowWindow(restore) result: {:?}", result);
             }
         }
 
@@ -222,6 +226,43 @@ fn toggle_window_visibility_of_pid(
 
     enumerate_windows(handler);
 
+    Ok(())
+}
+
+// Single-instance tray apps need their own activation protocol to update their
+// internal visibility state; showing their native HWND alone can leave it cloaked.
+fn toggle_via_executable(
+    pid: u32,
+    allowlisted_classes: &[String],
+    excluded_window_texts: &[String],
+) -> anyhow::Result<()> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    let mut foreground_pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut foreground_pid)) };
+    if foreground_pid == pid
+        && allowlisted_classes.contains(&get_class_name_of_window(hwnd)?)
+        && !excluded_window_texts.contains(&get_window_text(hwnd)?)
+        && unsafe { IsWindowVisible(hwnd) }.as_bool()
+        && !unsafe { IsIconic(hwnd) }.as_bool()
+    {
+        let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+        return Ok(());
+    }
+
+    // Resolve the running executable, so portable app paths need no configuration.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }?;
+    let mut path = vec![0u16; 32768];
+    let mut length = path.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            process, PROCESS_NAME_WIN32, windows::core::PWSTR(path.as_mut_ptr()), &mut length,
+        )
+    };
+    let close_result = unsafe { CloseHandle(process) };
+    result?;
+    close_result?;
+    let path = std::ffi::OsString::from_wide(&path[..length as usize]);
+    Command::new(path).spawn()?;
     Ok(())
 }
 
@@ -270,17 +311,21 @@ fn start_event_loop(config: &Config) {
         let exe_name = c.exe_name.clone();
         let allowlisted_classes = c.allowlisted_classes.clone();
         let excluded_window_texts = c.excluded_window_texts.clone();
+        let activate_via_exe = c.activate_via_exe;
 
         hkm.register(trigger_key, &modifiers.clone(), move || {
             debug!("Pressed {:?} + {:?}", modifiers, trigger_key);
 
             let pids = get_pids_of_exe(&exe_name).unwrap();
             for id in pids {
-                let _ = toggle_window_visibility_of_pid(
-                    id,
-                    &allowlisted_classes,
-                    &excluded_window_texts,
-                );
+                let result = if activate_via_exe {
+                    toggle_via_executable(id, &allowlisted_classes, &excluded_window_texts)
+                } else {
+                    toggle_window_visibility_of_pid(id, &allowlisted_classes, &excluded_window_texts)
+                };
+                if let Err(err) = result {
+                    log::error!("Failed to toggle {} (pid {}): {}", exe_name, id, err);
+                }
             }
         })
         .unwrap_or_else(|_| panic!("Failed to register hotkey {:?}", c));
@@ -301,6 +346,8 @@ struct Hotkey {
     modifiers: Vec<String>,
     allowlisted_classes: Vec<String>,
     excluded_window_texts: Vec<String>,
+    #[serde(default)]
+    activate_via_exe: bool,
 }
 
 fn main() {
@@ -321,4 +368,52 @@ fn main() {
     let config: Config = toml::from_str(&config_str).unwrap();
     dbg!(&config);
     start_event_loop(&config);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::{core::w, Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, SW_HIDE, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW,
+    }};
+
+    #[test]
+    fn restores_hidden_and_minimized_windows_without_bypassing_filters() {
+        // Use a real, initially hidden Win32 window to exercise the tray state.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(), w!("STATIC"), w!("Hotkey restore test 中文 — 📨"),
+                WS_OVERLAPPEDWINDOW, 0, 0, 200, 100, None, None, None, None,
+            ).unwrap()
+        };
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+        let _window = TestWindow(hwnd);
+        let title = "Hotkey restore test 中文 — 📨";
+        assert_eq!(get_window_text(hwnd).unwrap(), title);
+        let classes = vec![get_class_name_of_window(hwnd).unwrap()];
+        let pid = std::process::id();
+        assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+
+        toggle_window_visibility_of_pid(pid, &[], &[]).unwrap();
+        assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+        toggle_window_visibility_of_pid(pid, &classes, &[title.into()]).unwrap();
+        assert!(!unsafe { IsWindowVisible(hwnd) }.as_bool());
+
+        toggle_window_visibility_of_pid(pid, &classes, &[]).unwrap();
+        assert!(unsafe { IsWindowVisible(hwnd) }.as_bool());
+        assert!(!unsafe { IsIconic(hwnd) }.as_bool());
+
+        let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+        assert!(unsafe { IsIconic(hwnd) }.as_bool());
+        toggle_window_visibility_of_pid(pid, &classes, &[]).unwrap();
+        assert!(!unsafe { IsIconic(hwnd) }.as_bool());
+        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+        toggle_window_visibility_of_pid(pid, &classes, &[]).unwrap();
+        assert!(unsafe { IsWindowVisible(hwnd) }.as_bool());
+    }
 }

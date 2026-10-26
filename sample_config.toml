@@ -9,5 +9,6 @@ excluded_window_texts = []
 modifiers = ["alt", "ctrl"]
 trigger_key = "2"
 exe_name = "Telegram"
+activate_via_exe = true
 allowlisted_classes = ["Qt51515QWindowIcon", "Qt51519QWindowIcon"]
 excluded_window_texts = ["Media viewer"]
